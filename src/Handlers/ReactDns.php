@@ -13,8 +13,11 @@ use React\Dns\Query\TcpTransportExecutor;
 use React\Dns\Query\TimeoutException;
 use React\Dns\Query\TimeoutExecutor;
 use React\Dns\Query\UdpTransportExecutor;
+use React\EventLoop\LoopInterface;
 use React\EventLoop\StreamSelectLoop;
+use React\Promise\PromiseInterface;
 use Spatie\Dns\Exceptions\CouldNotFetchDns;
+use Spatie\Dns\Records\Record;
 use Throwable;
 
 /**
@@ -82,28 +85,58 @@ class ReactDns extends Handler
 
     public function __invoke(string $domain, int $flag, string $type): array
     {
-        $type = mb_strtoupper($type);
+        $lookup = $this->prepareLookup($domain, $type);
 
-        if (! isset($this->typeCodes[$type])) {
-            throw UnsupportedRecordType::make($type);
+        $response = $this->query($lookup['query'], $lookup['nameservers'], $lookup['description']);
+
+        return $this->toRecords($response, $lookup['type'], $lookup['description']);
+    }
+
+    /**
+     * Sends the query for every type at once and waits for all answers in one run of the
+     * event loop. The time this takes is about that of the slowest query, not their sum.
+     *
+     * The records and exceptions are the same as when each type is fetched on its own. When
+     * several types fail, the exception is the one of the first failing type in `$types`.
+     */
+    public function getRecordsForTypes(string $domain, array $types): array
+    {
+        $lookups = [];
+
+        $preparationError = null;
+
+        // Fetching each type on its own stops at the type that cannot be prepared, so later
+        // types are not prepared here either. The types before it are still queried, because
+        // one of them may fail first.
+        foreach ($types as $type) {
+            try {
+                $lookups[] = $this->prepareLookup($domain, $type);
+            } catch (Throwable $error) {
+                $preparationError = $error;
+
+                break;
+            }
         }
 
-        $nameservers = $this->nameserverAddresses();
+        $outcomes = $this->queryConcurrently($lookups);
 
-        $description = "{$domain} {$type} @".implode(',', $nameservers);
+        $records = [];
 
-        // react/dns adds the root dot itself, so a name that already ends in one would end twice.
-        $domain = $this->toAscii(rtrim($domain, '.'), $description);
+        foreach ($lookups as $index => $lookup) {
+            $outcome = $outcomes[$index];
 
-        $response = $this->query(
-            new Query($domain, $this->typeCodes[$type], Message::CLASS_IN),
-            $nameservers,
-            $description,
-        );
+            if ($outcome instanceof Throwable) {
+                throw CouldNotFetchDns::queryFailed($lookup['description'], $this->failureReason($outcome), $outcome);
+            }
 
-        $this->guardAgainstErrorResponse($response, $description);
+            $records = array_merge($records, $this->toRecords($outcome, $lookup['type'], $lookup['description']));
+        }
 
-        return $this->transform($type, $this->toLines($response, $type));
+        if ($preparationError !== null) {
+            throw $preparationError;
+        }
+
+        return $records;
     }
 
     /**
@@ -156,6 +189,77 @@ class ReactDns extends Handler
     {
         $loop = new StreamSelectLoop;
 
+        $result = null;
+
+        $settle = function (Message|Throwable $outcome) use (&$result): void {
+            $result = $outcome;
+        };
+
+        $this->sendQuery($query, $nameserver, $tries, $loop)->then($settle, $settle);
+
+        $loop->run();
+
+        return $result;
+    }
+
+    /**
+     * Starts every query on one private event loop and runs the loop until all of them have
+     * an answer or have failed. Returns the answer or the error of each lookup, by its key.
+     *
+     * @param  array<int, array{type: string, query: Query, nameservers: array<int, string>, description: string}>  $lookups
+     * @return array<int, Message|Throwable>
+     */
+    protected function queryConcurrently(array $lookups): array
+    {
+        $loop = new StreamSelectLoop;
+
+        $outcomes = [];
+
+        foreach ($lookups as $index => $lookup) {
+            $settle = function (Message|Throwable $outcome) use (&$outcomes, $index): void {
+                $outcomes[$index] = $outcome;
+            };
+
+            $this->queryInTurn($lookup['query'], $lookup['nameservers'], max(1, (int) $this->retries), $loop)
+                ->then($settle, $settle);
+        }
+
+        $loop->run();
+
+        return $outcomes;
+    }
+
+    /**
+     * Asks each nameserver in turn until one answers, like query() does, but without running
+     * the loop. The first nameserver gets all tries and every other nameserver gets one.
+     *
+     * @param  array<int, string>  $nameservers
+     * @return PromiseInterface<Message>
+     */
+    protected function queryInTurn(Query $query, array $nameservers, int $tries, LoopInterface $loop): PromiseInterface
+    {
+        $nameserver = array_shift($nameservers);
+
+        return $this->sendQuery($query, $nameserver, $tries, $loop)->then(
+            null,
+            function (Throwable $error) use ($query, $nameservers, $loop): PromiseInterface {
+                if ($nameservers === []) {
+                    throw $error;
+                }
+
+                return $this->queryInTurn($query, $nameservers, 1, $loop);
+            },
+        );
+    }
+
+    /**
+     * Sends the query to one nameserver on the given loop. The promise settles once the
+     * nameserver has answered or every try has failed.
+     *
+     * @return PromiseInterface<Message>
+     */
+    protected function sendQuery(Query $query, string $nameserver, int $tries, LoopInterface $loop): PromiseInterface
+    {
         // Like dig, a timeout below 1 counts as 1. The tries include the first attempt, and
         // RetryExecutor only counts the attempts after it.
         $executor = new RetryExecutor(
@@ -170,17 +274,47 @@ class ReactDns extends Handler
             $tries - 1,
         );
 
-        $result = null;
+        return $executor->query($query);
+    }
 
-        $settle = function (Message|Throwable $outcome) use (&$result): void {
-            $result = $outcome;
-        };
+    /**
+     * Checks the type and works out the query, the nameservers to ask and the description
+     * that goes into an exception. Throws where fetching this type would throw before any
+     * query is sent.
+     *
+     * @return array{type: string, query: Query, nameservers: array<int, string>, description: string}
+     */
+    protected function prepareLookup(string $domain, string $type): array
+    {
+        $type = mb_strtoupper($type);
 
-        $executor->query($query)->then($settle, $settle);
+        if (! isset($this->typeCodes[$type])) {
+            throw UnsupportedRecordType::make($type);
+        }
 
-        $loop->run();
+        $nameservers = $this->nameserverAddresses();
 
-        return $result;
+        $description = "{$domain} {$type} @".implode(',', $nameservers);
+
+        // react/dns adds the root dot itself, so a name that already ends in one would end twice.
+        $domain = $this->toAscii(rtrim($domain, '.'), $description);
+
+        return [
+            'type' => $type,
+            'query' => new Query($domain, $this->typeCodes[$type], Message::CLASS_IN),
+            'nameservers' => $nameservers,
+            'description' => $description,
+        ];
+    }
+
+    /**
+     * @return Record[]
+     */
+    protected function toRecords(Message $response, string $type, string $description): array
+    {
+        $this->guardAgainstErrorResponse($response, $description);
+
+        return $this->transform($type, $this->toLines($response, $type));
     }
 
     /**
