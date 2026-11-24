@@ -204,7 +204,7 @@ class ReactDns extends Handler
 
     /**
      * Starts every query on one private event loop and runs the loop until all of them have
-     * an answer or have failed. Returns the answer or the error of each lookup, by its key.
+     * an answer or have failed. Returns the answer or the error of each lookup, under the same index.
      *
      * @param  array<int, array{type: string, query: Query, nameservers: array<int, string>, description: string}>  $lookups
      * @return array<int, Message|Throwable>
